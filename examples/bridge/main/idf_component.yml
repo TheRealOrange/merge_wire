@@ -1,0 +1,4 @@
+dependencies:
+  merge_wire:
+    version: "*"
+    override_path: "../../../"

@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "RS485 half-duplex to UART full-duplex bridge"
+url: "https://github.com/TheRealOrange/merge_wire"
+dependencies:
+  idf: ">=5.0"
