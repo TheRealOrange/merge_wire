@@ -1,0 +1,13 @@
+menu "merge_wire UART <-> RS485 bridge"
+
+    config MERGE_WIRE_ISR_IN_IRAM
+        bool "Place bridge ISRs and buffers in IRAM/internal RAM"
+        default y
+        help
+            Keeps the bridge interrupt handlers executable and their data
+            reachable while the flash cache is disabled (flash writes, OTA).
+            Also adds ESP_INTR_FLAG_IRAM to both interrupt allocations.
+            Disable only if IRAM is scarce and no flash operations run
+            while the bridge is active.
+
+endmenu

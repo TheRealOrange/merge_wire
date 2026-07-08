@@ -1,0 +1,153 @@
+menu "RS485 to UART Bridge Example Configuration"
+
+    orsource "$IDF_PATH/examples/common_components/env_caps/$IDF_TARGET/Kconfig.env_caps"
+
+    # NOTE ON UART0 (non-S3/plain ESP32 targets): On ESP32-S3 and plain ESP32 the two
+    # bridge UARTs default to UART1/UART2, leaving UART0 free. On every other
+    # target here (C3/C6/C61/H-series, which only have UART0 + UART1) the
+    # full-duplex port falls back to UART0 which is the default console/log port.
+    # There, UART0 must be freed before the bridge can use it: move the console
+    # to the USB Serial/JTAG controller (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG) or
+    # disable it, otherwise console output will corrupt the bridge traffic.
+
+    config RS485_UART_PORT_NUM
+        int "RS485 UART port number"
+        range 0 2 if IDF_TARGET_ESP32 || IDF_TARGET_ESP32S3
+        default 2 if IDF_TARGET_ESP32 || IDF_TARGET_ESP32S3
+        range 0 1
+        default 1
+        help
+            UART communication port number for the RS485 port.
+            See UART documentation for available port numbers.
+
+    config RS485_UART_BAUD_RATE
+        int "UART communication speed"
+        range 1200 SOC_UART_BITRATE_MAX
+        default 115200
+        help
+            UART communication speed.
+
+    config RS485_RX_IO
+        int "RS485 RXD pin number"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_IN_RANGE_MAX
+        default 18 if IDF_TARGET_ESP32S3
+        default 22 if IDF_TARGET_ESP32
+        default 8
+        help
+            GPIO number for RS485 RO pin. See UART documentation for more information
+            about available pin numbers for UART.
+
+    config RS485_TX_IO
+        int "RS485 TXD pin number"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
+        default 17 if IDF_TARGET_ESP32S3
+        default 23 if IDF_TARGET_ESP32
+        default 9
+        help
+            GPIO number for RS485 DI pin. See UART documentation for more information
+            about available pin numbers for UART.
+
+    config RS485_DIRECTION_IO
+        int "RS485 ~RE/DE pin number"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
+        default 8 if IDF_TARGET_ESP32S3
+        default 18 if IDF_TARGET_ESP32
+        default 13 if IDF_TARGET_ESP32C6 || IDF_TARGET_ESP32C61 || IDF_TARGET_ESP32H4
+        default 10
+        help
+            GPIO number for the pin to connected to
+            ~RE/DE pin of RS485 transceiver to switch direction.
+            See UART documentation for more information about available pin
+            numbers for UART.
+
+    config FULL_DUPLEX_UART_PORT_NUM
+        int "Full-duplex UART port number"
+        range 0 2 if IDF_TARGET_ESP32 || IDF_TARGET_ESP32S3
+        default 1 if IDF_TARGET_ESP32 || IDF_TARGET_ESP32S3
+        range 0 1
+        default 0
+        help
+            UART communication port number for the full-duplex UART.
+            See UART documentation for available port numbers.
+            NOTE: On targets other than ESP32/ESP32-S3 this defaults to UART0,
+            which is the default console. Free UART0 first (move the console to
+            USB Serial/JTAG or disable it) before using it for the bridge.
+
+    config FULL_DUPLEX_UART_BAUD_RATE
+            int "Full-duplex UART communication speed"
+            range 1200 SOC_UART_BITRATE_MAX
+            default 115200
+            help
+                UART communication speed.
+
+    config FULL_DUPLEX_UART_RX_IO
+        int "Full-duplex UART RXD pin number"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_IN_RANGE_MAX
+        default 5 if IDF_TARGET_ESP32S3
+        default 22 if IDF_TARGET_ESP32
+        default 6
+        help
+            GPIO number for full-duplex UART RO pin. See UART documentation for more information
+            about available pin numbers for UART.
+
+    config FULL_DUPLEX_UART_TX_IO
+        int "Full-duplex UART TXD pin number"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
+        default 4 if IDF_TARGET_ESP32S3
+        default 23 if IDF_TARGET_ESP32
+        default 7
+        help
+            GPIO number for full-duplex UART DI pin. See UART documentation for more information
+            about available pin numbers for UART.
+
+    config FULL_DUPLEX_UART_HW_FLOWCTRL
+        bool "Use HW flow control on the full-duplex UART"
+        default n
+        help
+            Whether to enable HW flow control on the full-duplex UART port.
+            Note: ESP32 UART hardware only implements RTS/CTS flow control.
+            DTR/DSR below are provided for convenience but are not driven by
+            the UART peripheral; handle them in software if you need them.
+
+    config FULL_DUPLEX_UART_RTS_IO
+        int "Full-duplex UART RTS pin number"
+        depends on FULL_DUPLEX_UART_HW_FLOWCTRL
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
+        default 6 if IDF_TARGET_ESP32S3
+        default 22 if IDF_TARGET_ESP32
+        default 11
+        help
+            GPIO number for full-duplex UART RTS pin. See UART documentation for more information
+            about available pin numbers for UART.
+
+    config FULL_DUPLEX_UART_CTS_IO
+        int "Full-duplex UART CTS pin number"
+        depends on FULL_DUPLEX_UART_HW_FLOWCTRL
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_IN_RANGE_MAX
+        default 7 if IDF_TARGET_ESP32S3
+        default 23 if IDF_TARGET_ESP32
+        default 12
+        help
+            GPIO number for full-duplex UART CTS pin. See UART documentation for more information
+            about available pin numbers for UART.
+
+    config FULL_DUPLEX_UART_DTR_IO
+        int "Full-duplex UART DTR pin number"
+        depends on FULL_DUPLEX_UART_HW_FLOWCTRL
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
+        default 15 if IDF_TARGET_ESP32S3
+        default 25 if IDF_TARGET_ESP32
+        default 14
+        help
+            GPIO number for full-duplex UART DTR pin (software-driven; see note above).
+
+    config FULL_DUPLEX_UART_DSR_IO
+        int "Full-duplex UART DSR pin number"
+        depends on FULL_DUPLEX_UART_HW_FLOWCTRL
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_IN_RANGE_MAX
+        default 16 if IDF_TARGET_ESP32S3
+        default 26 if IDF_TARGET_ESP32
+        default 21
+        help
+            GPIO number for full-duplex UART DSR pin (software-driven; see note above).
+endmenu
