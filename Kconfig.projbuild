@@ -10,4 +10,34 @@ menu "merge_wire UART <-> RS485 bridge"
             Disable only if IRAM is scarce and no flash operations run
             while the bridge is active.
 
+
+    choice MERGE_WIRE_COLLISION_POLICY
+        prompt "Collision handling for the chunk on the wire"
+        default MERGE_WIRE_COLLISION_RETRY
+        help
+            What to do with the MAIN -> RS485 chunk that was being
+            transmitted when a collision was detected.
+
+        config MERGE_WIRE_COLLISION_RETRY
+            bool "Replay the chunk (commit only when verified)"
+            help
+                The in-flight chunk is only returned to the ring buffer once
+                TX_DONE confirms it reached the wire without a clash. On a
+                collision it is rewound and replayed after a randomized
+                exponential backoff, up to MW_MAX_RETRIES attempts, then
+                dropped. This behaves like a native CSMA node when chunks
+                align with the sender's frames (idle-gap delimited traffic).
+
+        config MERGE_WIRE_COLLISION_DROP
+            bool "Drop the chunk (back off, continue with next data)"
+            help
+                The bridge is frame-unaware: every receiver already saw the
+                corrupted frame, so replaying a possibly mid-frame slice
+                cannot repair it and may inject a duplicated garbled
+                fragment. This policy drops the collided chunk immediately,
+                backs off with jitter to avoid re-colliding in lockstep, and
+                continues with whatever is queued next, leaving recovery to
+                the end-to-end protocol. MW_MAX_RETRIES has no effect.
+    endchoice
+
 endmenu

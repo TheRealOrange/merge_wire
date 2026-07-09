@@ -43,6 +43,9 @@ typedef struct {
   // buffer health
   bool buffer_full_flg;                    /*!< Bridging buffer full flag*/
   int buffered_len;                        /*!< Bridging buffer cached data length in bytes*/
+  uint32_t rx_bytes;                       /*!< bytes ingested from the producer RX FIFO*/
+  uint32_t tx_bytes;                       /*!< bytes fed into the consumer TX FIFO*/
+  uint32_t breaks_tx;                      /*!< break conditions regenerated on the consumer*/
 
   // fifo data buffers
   uint8_t *producer_rx_data_buf;           /*!< Producer data buffer to stash RX FIFO data or store stashed chunks to be sent to consumer*/
@@ -73,7 +76,8 @@ typedef struct {
   esp_timer_handle_t kick;                 /*!< RS485 UART deferred pump / backoff timer*/
 
   // diagnostics: inspect in a debugger; wire a getter later if wanted
-  uint32_t collisions, retries_total, tx_giveups, breaks_forwarded;
+  uint32_t collisions, retries_total, tx_giveups;
+  uint32_t fd_rx_overflows, rs485_rx_overflows, rs485_line_errors;
 
   /* one lock for ALL shared bridge state: both ISRs and the kick timer
    * callback take it, so correctness is independent of core and level.

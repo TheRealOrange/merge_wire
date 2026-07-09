@@ -135,7 +135,7 @@ void BRIDGE_ISR_ATTR bridge_service_producer(bridge_port_obj_t *ctx, BaseType_t 
   }
 }
 
-void BRIDGE_ISR_ATTR bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool *brk_waiting_int_ena, bool *chunk_in_flight, bool *ringbuf_empty, BaseType_t *HPTaskAwoken, bool *need_yield) {
+void BRIDGE_ISR_ATTR bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool defer_return, bool *brk_waiting_int_ena, bool *chunk_in_flight, bool *ringbuf_empty, BaseType_t *HPTaskAwoken, bool *need_yield) {
   uart_port_t consumer_port = ctx->consumer_port;
   // whether or not we enabled the break interrupts because a break is scheduled
   if (brk_waiting_int_ena) *brk_waiting_int_ena = false;
@@ -172,6 +172,7 @@ void BRIDGE_ISR_ATTR bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool *brk_waiti
           uart_hal_ena_intr_mask(&(merge_wire_uart_context[consumer_port].hal), UART_INTR_TX_BRK_DONE);
           UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[consumer_port].spinlock));
           ctx->consumer_tx_waiting_brk = true;
+          ctx->breaks_tx++;
 
           // signal that we have a break waiting
           // and that we enabled the break interrupts
@@ -201,12 +202,19 @@ void BRIDGE_ISR_ATTR bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool *brk_waiti
       // fill the TX fifo from the chunk
       uint32_t send_len = bridge_enable_tx_write_fifo(consumer_port, ctx->tx_ptr, MIN(ctx->chunk_rem_len, tx_fifo_rem));
       if (chunk_in_flight) *chunk_in_flight = true;
+      ctx->tx_bytes += send_len;
 
       ctx->tx_ptr += send_len;
       ctx->chunk_rem_len -= send_len;
       tx_fifo_rem -= send_len;
 
       if (ctx->chunk_rem_len == 0) {
+        if (defer_return) {
+          // rs485 consumer: the chunk is FED but not yet VERIFIED on the wire.
+          // keep it un-returned so the collision path can rewind (or drop) it;
+          // the TX_DONE(idle) commit returns it. do not pull the next chunk.
+          break;
+        }
         vRingbufferReturnItemFromISR(ctx->bridging_ringbuf, ctx->chunk_in_flight, HPTaskAwoken);
         *need_yield |= (*HPTaskAwoken == pdTRUE);
         ctx->chunk_in_flight = NULL;
@@ -441,4 +449,27 @@ esp_err_t bridge_driver_set_pins(uart_port_t uart_num, gpio_num_t tx_pin, gpio_n
   merge_wire_uart_context[uart_num].dsr_io_num = dsr_pin;
 
   return ESP_OK;
+}
+
+
+void bridge_driver_get_stats(uart_port_t any_bridge_port, bridge_stats_t *out) {
+  bridge_context_t *ctx = merge_wire_driver_uart_ctx[any_bridge_port].uart_ctx;
+  if (ctx == NULL || out == NULL) {
+    return;
+  }
+  portENTER_CRITICAL(&ctx->lock);
+  out->fd_rx_bytes        = ctx->fd_uart_to_rs485.rx_bytes;
+  out->rs485_tx_bytes     = ctx->fd_uart_to_rs485.tx_bytes;
+  out->rs485_rx_bytes     = ctx->rs485_to_fd_uart.rx_bytes;
+  out->fd_tx_bytes        = ctx->rs485_to_fd_uart.tx_bytes;
+  out->collisions         = ctx->collisions;
+  out->retries            = ctx->retries_total;   // always 0 under COLLISION_DROP
+  out->tx_giveups         = ctx->tx_giveups;      // under COLLISION_DROP: every collision-dropped chunk
+  out->breaks_forwarded   = ctx->fd_uart_to_rs485.breaks_tx + ctx->rs485_to_fd_uart.breaks_tx;
+  out->breaks_dropped     = 0;  // no silent-drop path: a failed break send stashes or parks, never vanishes
+  out->fd_rx_overflows    = ctx->fd_rx_overflows;
+  out->rs485_rx_overflows = ctx->rs485_rx_overflows;
+  out->fd_line_errors     = 0;  // FRAM/PARITY not enabled on the fd port
+  out->rs485_line_errors  = ctx->rs485_line_errors;
+  portEXIT_CRITICAL(&ctx->lock);
 }

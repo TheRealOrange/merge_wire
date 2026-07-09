@@ -17,8 +17,10 @@ static uint32_t BRIDGE_ISR_ATTR xrnd(bridge_context_t *c) {
 // call with c->lock held
 static void BRIDGE_ISR_ATTR bridge_rs485_return_chunk(bridge_context_t *ctx, BaseType_t *HPTaskAwoken, bool *need_yield) {
   bridge_port_obj_t *port_obj = &ctx->fd_uart_to_rs485;
-  vRingbufferReturnItemFromISR(port_obj->bridging_ringbuf, port_obj->chunk_in_flight, HPTaskAwoken);
-  *need_yield |= (*HPTaskAwoken == pdTRUE);
+  if (port_obj->chunk_in_flight != NULL) {
+    vRingbufferReturnItemFromISR(port_obj->bridging_ringbuf, port_obj->chunk_in_flight, HPTaskAwoken);
+    *need_yield |= (*HPTaskAwoken == pdTRUE);
+  }
   port_obj->chunk_in_flight = NULL;
   port_obj->tx_ptr = NULL;
   port_obj->chunk_rem_len = 0;
@@ -30,6 +32,19 @@ static void BRIDGE_ISR_ATTR bridge_rs485_return_chunk(bridge_context_t *ctx, Bas
 // after MW_MAX_RETRIES) and arm a randomized binary-exponential backoff.
 // call with c->lock held, r_state already back to R_IDLE.                    */
 static void BRIDGE_ISR_ATTR bridge_rs485_schedule_retry(bridge_context_t *ctx, BaseType_t *HPTaskAwoken, bool *need_yield) {
+#if CONFIG_MERGE_WIRE_COLLISION_DROP
+  // frame-unaware drop policy: every receiver already saw the corrupted
+  // frame, so replaying this (possibly mid-frame) slice cannot repair it and
+  // may inject a duplicated garbled fragment. drop the collided chunk, back
+  // off with jitter, continue with whatever is queued next; recovery belongs
+  // to the end-to-end protocol.
+  ctx->tx_giveups++;                       // counts collision-dropped chunks
+  bridge_rs485_return_chunk(ctx, HPTaskAwoken, need_yield);
+  uint32_t exp = 1;                        // one doubled quiet window of jitter
+#else
+  // commit-when-verified replay policy: the in-flight chunk was never
+  // returned to the ring, so rewind and replay it after a randomized
+  // exponential backoff -- native CSMA behaviour when chunks track frames.
   ctx->burst_retries++;
   ctx->retries_total++;
   if (ctx->burst_retries > MW_MAX_RETRIES) {
@@ -40,6 +55,7 @@ static void BRIDGE_ISR_ATTR bridge_rs485_schedule_retry(bridge_context_t *ctx, B
     ctx->fd_uart_to_rs485.chunk_rem_len = ctx->fd_uart_to_rs485.chunk_in_flight->data_len;
   }
   uint32_t exp = ctx->burst_retries > 4 ? 4 : ctx->burst_retries;
+#endif
   uint64_t backoff = (uint64_t) ctx->quiet_us * (1 + (xrnd(ctx) % (1u << exp)));
 
   // if there is already a timer running and it is for a time later than the backoff
@@ -117,7 +133,7 @@ void BRIDGE_ISR_ATTR bridge_rs485_carrier_sense_try_tx(bridge_context_t *ctx, Ba
     DE_ASSERT(uart_num);
     esp_rom_delay_us(DE_SETTLE_US);
     ctx->r_state = BRIDGE_RS485_TX;
-    bridge_fill_tx_fifo(&ctx->fd_uart_to_rs485, &brk_waiting, &chunk_in_flight, &ringbuf_empty, HPTaskAwoken, need_yield);
+    bridge_fill_tx_fifo(&ctx->fd_uart_to_rs485, true, &brk_waiting, &chunk_in_flight, &ringbuf_empty, HPTaskAwoken, need_yield);
     UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
     if (brk_waiting) {
       // we scheduled a forwarded BRK
@@ -144,6 +160,8 @@ void BRIDGE_ISR_ATTR bridge_rs485_kick_cb(void *arg) {          // esp_timer tas
   BaseType_t HPTaskAwoken = 0;
   bool need_yield = false;
   portENTER_CRITICAL(&ctx->lock);
+  // the one-shot that invoked us has fired: no kick is scheduled any more
+  ctx->kick_scheduled_flg = false;
   // in the kick, we check if the medium is idle and try TX if available, if not another kick is scheduled
   bridge_rs485_carrier_sense_try_tx(ctx, &HPTaskAwoken, &need_yield);
   need_yield |= (HPTaskAwoken == pdTRUE);
@@ -192,7 +210,7 @@ void BRIDGE_ISR_ATTR bridge_rs485_intr_handler(void *param) {
         uart_hal_tx_break(&(merge_wire_uart_context[uart_num].hal), MW_JAM_BITS);
         uart_hal_ena_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_BRK_DONE);
         UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
-        ctx->r_state = R_JAM;          // DE stays, transmit jam so everyone sees the clash
+        ctx->r_state = BRIDGE_RS485_JAM;          // DE stays, transmit jam so everyone sees the clash
 #else
         // arm the TX_DONE interrupt so we know when the TX fifo is done emptying
         uart_hal_ena_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_DONE);
@@ -204,6 +222,10 @@ void BRIDGE_ISR_ATTR bridge_rs485_intr_handler(void *param) {
         ctx->r_state = BRIDGE_RS485_DRAIN;
         // TX_DONE(idle) finishes the cleanup
 #endif
+      }
+      if (ctx->r_state == BRIDGE_RS485_IDLE) {
+        // nothing of ours is on the wire: remote line noise
+        ctx->rs485_line_errors++;
       }
       uart_hal_clr_intsts_mask(&(merge_wire_uart_context[uart_num].hal), RS485_ERR_MASK);
     } else if (uart_intr_status & (UART_INTR_RXFIFO_TOUT | UART_INTR_RXFIFO_FULL |
@@ -234,6 +256,7 @@ void BRIDGE_ISR_ATTR bridge_rs485_intr_handler(void *param) {
           if (sent) {
             UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
             port_obj->buffered_len += chunk->data_len;
+            port_obj->rx_bytes += chunk->data_len;
             UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
             rx_buffer_free = true;
           } else {
@@ -284,12 +307,15 @@ void BRIDGE_ISR_ATTR bridge_rs485_intr_handler(void *param) {
       // the frame edge that raised this interrupt may be our chance to transmit
       ctx->last_bus_rx_us = esp_timer_get_time();
 
-      // schedule a kick to check if the bus has been idle
+      // the frame edge that raised this interrupt may be our chance to
+      // transmit: run carrier sense (its idle guard makes this safe mid-burst)
+      bridge_rs485_carrier_sense_try_tx(ctx, &HPTaskAwoken, &need_yield);
     } else if (uart_intr_status & UART_INTR_RXFIFO_OVF) {
       UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
       uart_hal_rxfifo_rst(&(merge_wire_uart_context[uart_num].hal));
       UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
       uart_hal_clr_intsts_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_RXFIFO_OVF);
+      ctx->rs485_rx_overflows++;
     } else if (uart_intr_status & UART_INTR_TXFIFO_EMPTY) {
       // tx fifo empty, clear the intr mask while we are handling txfifo empty
       UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
@@ -302,7 +328,7 @@ void BRIDGE_ISR_ATTR bridge_rs485_intr_handler(void *param) {
       if (ctx->r_state == BRIDGE_RS485_TX) {
         // we are currently already TX'ing so it is safe to push data onto the bus
         // try to fill the TX FIFO from the producer to consumer bridging ring buffer
-        bridge_fill_tx_fifo(&ctx->fd_uart_to_rs485, &brk_waiting, &chunk_in_flight, &ringbuf_empty, &HPTaskAwoken, &need_yield);
+        bridge_fill_tx_fifo(&ctx->fd_uart_to_rs485, true, &brk_waiting, &chunk_in_flight, &ringbuf_empty, &HPTaskAwoken, &need_yield);
         UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[ctx->rs485_uart_num].spinlock));
         if (brk_waiting) {
           // we scheduled a forwarded BRK
@@ -331,8 +357,12 @@ void BRIDGE_ISR_ATTR bridge_rs485_intr_handler(void *param) {
         // on the next loop we check again on uart_hal_is_tx_idle
         postponed = true;
       } else if (ctx->r_state == BRIDGE_RS485_TX) {
-        // we are currently TX'ing so we continue
-        bridge_fill_tx_fifo(&ctx->fd_uart_to_rs485, &brk_waiting, &chunk_in_flight, &ringbuf_empty, &HPTaskAwoken, &need_yield);
+        // the in-flight chunk is fully on the wire and echo-verified:
+        // COMMIT it (return to the ring) before chaining the next one
+        if (ctx->fd_uart_to_rs485.chunk_in_flight != NULL && ctx->fd_uart_to_rs485.chunk_rem_len == 0) {
+          bridge_rs485_return_chunk(ctx, &HPTaskAwoken, &need_yield);
+        }
+        bridge_fill_tx_fifo(&ctx->fd_uart_to_rs485, true, &brk_waiting, &chunk_in_flight, &ringbuf_empty, &HPTaskAwoken, &need_yield);
         if (brk_waiting) {
           // there is a BRK waiting to be sent
           ctx->r_state = BRIDGE_RS485_BRK;
@@ -348,6 +378,11 @@ void BRIDGE_ISR_ATTR bridge_rs485_intr_handler(void *param) {
           UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
           uart_hal_clr_intsts_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_DONE);
           uart_hal_disable_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_DONE);
+          UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
+        } else if (ctx->fd_uart_to_rs485.chunk_rem_len > 0 || !ringbuf_empty) {
+          // chained chunk larger than the FIFO (or more queued): stream it
+          UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
+          uart_hal_ena_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TXFIFO_EMPTY);
           UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
         }
         uart_hal_clr_intsts_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_DONE);
@@ -385,9 +420,23 @@ void BRIDGE_ISR_ATTR bridge_rs485_intr_handler(void *param) {
       // unlike in the full-duplex UART, we do NOT re-enable the TXFIFO_EMPTY interrupt
       // once we have sent the BRK, we wait for other conditions to resume the TXFIFO_EMPTY interrupt
       if (ctx->r_state == BRIDGE_RS485_BRK) {
-        // this is a forwarded BRK not a jam
-        // try to fill the TX FIFO again from the producer to consumer bridging ring buffer
-        bridge_rs485_carrier_sense_try_tx(ctx, &HPTaskAwoken, &need_yield);
+        // this is a forwarded BRK not a jam: chain DIRECTLY under the held DE.
+        // carrier sense must not run here -- its idle guard would early-out on
+        // r_state == BRK and wedge the machine, and our own break echo just
+        // stamped the carrier-sense clock anyway.
+        bridge_fill_tx_fifo(&ctx->fd_uart_to_rs485, true, &brk_waiting, &chunk_in_flight, &ringbuf_empty, &HPTaskAwoken, &need_yield);
+        if (brk_waiting) {
+          ctx->r_state = BRIDGE_RS485_BRK;   // back-to-back breaks
+        } else if (chunk_in_flight || !ringbuf_empty) {
+          ctx->r_state = BRIDGE_RS485_TX;
+          UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
+          uart_hal_clr_intsts_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_DONE);
+          uart_hal_ena_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_DONE | UART_INTR_TXFIFO_EMPTY);
+          UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
+        } else {
+          DE_RELEASE(uart_num);
+          ctx->r_state = BRIDGE_RS485_IDLE;
+        }
       } else if (ctx->r_state == BRIDGE_RS485_JAM) {
         // this BRK source was due to a collision triggering a bus jam
         // now that we are done, relinquish the bus
