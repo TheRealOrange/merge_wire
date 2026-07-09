@@ -25,8 +25,8 @@ extern bridge_uart_port_context_t merge_wire_uart_context[UART_NUM_MAX];
 #define UART_EXIT_CRITICAL(spinlock)         esp_os_exit_critical(spinlock)
 
 uint32_t bridge_enable_tx_write_fifo(uart_port_t uart_num, const uint8_t *pbuf, uint32_t len);
-bool bridge_try_send_ring_buf(RingbufHandle_t ringbuf, const uint8_t *data, uint32_t len, bool *buf_full_flag, uart_port_t producer_port, BaseType_t *HPTaskAwoken, bool *need_yield);
-void bridge_service_producer(RingbufHandle_t ringbuf, bridge_uart_data_t *stashed, bool *buf_full_flag, uint8_t *brk_flg, uint8_t brk_len, uart_port_t producer_port, BaseType_t *HPTaskAwoken, bool *need_yield);
+bool bridge_try_send_ring_buf(bridge_port_obj_t *ctx, uart_port_t producer_port, const uint8_t *data, uint32_t len, BaseType_t *HPTaskAwoken, bool *need_yield;
+void bridge_service_producer(bridge_port_obj_t *ctx, uart_port_t producer_port, BaseType_t *HPTaskAwoken, bool *need_yield);
 void bridge_read_fifo_chunk(uart_port_t port, uint8_t *stash_buf, uint32_t status, bool *got_brk);
 
 void bridge_rs485_kick_cb(void *arg);
