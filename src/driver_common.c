@@ -61,7 +61,8 @@ uint32_t BRIDGE_ISR_ATTR bridge_enable_tx_write_fifo(uart_port_t uart_num, const
   return sent_len;
 }
 
-bool BRIDGE_ISR_ATTR bridge_try_send_ring_buf(bridge_port_obj_t *ctx, uart_port_t producer_port, const uint8_t *data, uint32_t len, BaseType_t *HPTaskAwoken, bool *need_yield) {
+bool BRIDGE_ISR_ATTR bridge_try_send_ring_buf(bridge_port_obj_t *ctx, const uint8_t *data, uint32_t len, BaseType_t *HPTaskAwoken, bool *need_yield) {
+  uart_port_t producer_port = ctx->producer_port;
   BaseType_t sent = pdFALSE;
   // try to send the data to the ring buffer
   sent = xRingbufferSendFromISR(ctx->bridging_ringbuf, data, len, HPTaskAwoken);
@@ -86,7 +87,8 @@ bool BRIDGE_ISR_ATTR bridge_try_send_ring_buf(bridge_port_obj_t *ctx, uart_port_
   return true;
 }
 
-void BRIDGE_ISR_ATTR bridge_service_producer(bridge_port_obj_t *ctx, uart_port_t producer_port, BaseType_t *HPTaskAwoken, bool *need_yield) {
+void BRIDGE_ISR_ATTR bridge_service_producer(bridge_port_obj_t *ctx, BaseType_t *HPTaskAwoken, bool *need_yield) {
+  uart_port_t producer_port = ctx->producer_port;
   if (ctx->buffer_full_flg == true) {
     // buffer was previously full and we have a stashed chunk waiting
     // and possibly a stashed break too
@@ -133,87 +135,87 @@ void BRIDGE_ISR_ATTR bridge_service_producer(bridge_port_obj_t *ctx, uart_port_t
   }
 }
 
-void BRIDGE_ISR_ATTR bridge_fill_tx_fifo(bridge_port_obj_t *ctx, uart_port_t producer_port, BaseType_t *HPTaskAwoken, bool *need_yield) {
+void BRIDGE_ISR_ATTR bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool *brk_waiting_int_ena, bool *chunk_in_flight, bool *ringbuf_empty, BaseType_t *HPTaskAwoken, bool *need_yield) {
+  uart_port_t consumer_port = ctx->consumer_port;
+  // whether or not we enabled the break interrupts because a break is scheduled
+  if (brk_waiting_int_ena) *brk_waiting_int_ena = false;
+  // whether or not there is still a chunk in flight
+  if (chunk_in_flight) *chunk_in_flight = false;
+  // whether or not the bridging ringbuf is empty
+  if (ringbuf_empty) *ringbuf_empty = false;
+
   // if we have a break condition waiting, its normal for the txfifo to run empty
   // so we ignore and continue the interrupt handling
-  if (ctx->tx_waiting_brk) {
+  if (ctx->consumer_tx_waiting_brk) {
+    // signal that we have a break waiting
+    // and that we enabled the break interrupts
+    if (brk_waiting_int_ena) *brk_waiting_int_ena = true;
     return;
   }
 
-  // whether to enable txfifo empty interrupt after we fill the fifo
-  bool en_tx_flg = false;
-  uint32_t tx_fifo_rem = uart_hal_get_txfifo_len(&(merge_wire_uart_context[uart_num].hal));
+  uint32_t tx_fifo_rem = uart_hal_get_txfifo_len(&(merge_wire_uart_context[consumer_port].hal));
 
   // no break waiting, check if we have any data waiting to be sent
   while (tx_fifo_rem > 0) {
     // check if we have a chunk in flight
-    if (ctx->rs485_to_uart_chunk_rem_len == 0) {
+    if (ctx->chunk_rem_len == 0) {
       // no chunk in flight, grab a new chunk from the ringbuf
       size_t size;
-      bridge_uart_data_t *chunk = xRingbufferReceiveFromISR(ctx->rs485_to_uart_ring_buf, &size);
+      bridge_uart_data_t *chunk = xRingbufferReceiveFromISR(ctx->bridging_ringbuf, &size);
       if (chunk) {
         // received data from the ringbuf
         if (chunk->tx_brk_len > 0) {
           // no data in this chunk, set up break
-          uart_hal_clr_intsts_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_BRK_DONE);
-          UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
-          uart_hal_tx_break(&(merge_wire_uart_context[uart_num].hal), chunk->tx_brk_len);
-          uart_hal_ena_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_BRK_DONE);
-          UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
-          ctx->fd_tx_waiting_brk = 1;
+          uart_hal_clr_intsts_mask(&(merge_wire_uart_context[consumer_port].hal), UART_INTR_TX_BRK_DONE);
+          UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[consumer_port].spinlock));
+          uart_hal_tx_break(&(merge_wire_uart_context[consumer_port].hal), chunk->tx_brk_len);
+          uart_hal_ena_intr_mask(&(merge_wire_uart_context[consumer_port].hal), UART_INTR_TX_BRK_DONE);
+          UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[consumer_port].spinlock));
+          ctx->consumer_tx_waiting_brk = true;
 
-          //do not enable TX empty interrupt
-          en_tx_flg = false;
+          // signal that we have a break waiting
+          // and that we enabled the break interrupts
+          if (brk_waiting_int_ena) *brk_waiting_int_ena = true;
 
           // return the item to the ISR since we are done processing it
-          vRingbufferReturnItemFromISR(ctx->rs485_to_uart_ring_buf, chunk, &HPTaskAwoken);
-          need_yield |= (HPTaskAwoken == pdTRUE);
-          bridge_service_producer(
-            ctx->rs485_to_uart_ring_buf,
-            (bridge_uart_data_t *) ctx->rs485_rx_data_buf,
-            &ctx->rs485_to_uart_buffer_full_flg,
-            &ctx->rs485_tx_brk_flg, ctx->rs485_tx_brk_len,
-            ctx->rs485_uart_num,
-            &HPTaskAwoken, &need_yield);
+          vRingbufferReturnItemFromISR(ctx->bridging_ringbuf, chunk, HPTaskAwoken);
+          *need_yield |= (*HPTaskAwoken == pdTRUE);
+          bridge_service_producer(ctx, HPTaskAwoken, need_yield);
 
           // break from the loop to handle the tx brk send
           break;
         }
 
         // this is a data chunk
-        ctx->rs485_to_uart_chunk_rem_len = chunk->data_len;
-        ctx->rs485_to_uart_chunk = chunk;
-        ctx->fd_tx_ptr = chunk->data;
+        ctx->chunk_rem_len = chunk->data_len;
+        ctx->chunk_in_flight = chunk;
+        ctx->tx_ptr = chunk->data;
+        *chunk_in_flight = true;
       } else {
         // cannot get data from ring buffer, return;
+        if (ringbuf_empty) *ringbuf_empty = true;
         break;
       }
     }
 
-    if (ctx->rs485_to_uart_chunk_rem_len > 0) {
+    if (ctx->chunk_rem_len > 0) {
       // fill the TX fifo from the chunk
-      uint32_t send_len = bridge_enable_tx_write_fifo(uart_num, ctx->fd_tx_ptr,
-        MIN(ctx->rs485_to_uart_chunk_rem_len, tx_fifo_rem));
+      uint32_t send_len = bridge_enable_tx_write_fifo(consumer_port, ctx->tx_ptr, MIN(ctx->chunk_rem_len, tx_fifo_rem));
 
-      ctx->fd_tx_ptr += send_len;
-      ctx->rs485_to_uart_chunk_rem_len -= send_len;
+      ctx->tx_ptr += send_len;
+      ctx->chunk_rem_len -= send_len;
       tx_fifo_rem -= send_len;
 
-      if (ctx->rs485_to_uart_chunk_rem_len == 0) {
-        vRingbufferReturnItemFromISR(ctx->rs485_to_uart_ring_buf, ctx->rs485_to_uart_chunk, &HPTaskAwoken);
-        need_yield |= (HPTaskAwoken == pdTRUE);
-        ctx->fd_tx_ptr = NULL;
-        bridge_service_producer(
-            ctx->rs485_to_uart_ring_buf,
-            (bridge_uart_data_t *) ctx->rs485_rx_data_buf,
-            &ctx->rs485_to_uart_buffer_full_flg,
-            &ctx->rs485_tx_brk_flg, ctx->rs485_tx_brk_len,
-            ctx->rs485_uart_num,
-            &HPTaskAwoken, &need_yield);
+      if (ctx->chunk_rem_len == 0) {
+        vRingbufferReturnItemFromISR(ctx->bridging_ringbuf, ctx->chunk_in_flight, HPTaskAwoken);
+        *need_yield |= (*HPTaskAwoken == pdTRUE);
+        ctx->chunk_in_flight = NULL;
+        ctx->tx_ptr = NULL;
+        bridge_service_producer(ctx, HPTaskAwoken, need_yield);
+        // chunk fully sent
+        *chunk_in_flight = false;
       }
-
-      // enable TX empty interrupt to handle subsequent chunks
-      en_tx_flg = true;
+      // chunk partially sent
     }
   }
 }
@@ -284,10 +286,9 @@ static bridge_context_t *bridge_alloc_driver_ctx(uart_port_t uart_num, uart_port
 
   ctx->fd_tx_mux = xSemaphoreCreateMutexWithCaps(BRIDGE_MALLOC_CAPS);
   ctx->fd_rx_mux = xSemaphoreCreateMutexWithCaps(BRIDGE_MALLOC_CAPS);
-  ctx->fd_tx_brk_sem = xSemaphoreCreateBinaryWithCaps(BRIDGE_MALLOC_CAPS);
   ctx->fd_tx_done_sem = xSemaphoreCreateBinaryWithCaps(BRIDGE_MALLOC_CAPS);
   ctx->fd_tx_fifo_sem = xSemaphoreCreateBinaryWithCaps(BRIDGE_MALLOC_CAPS);
-  if (!ctx->fd_tx_mux || !ctx->fd_rx_mux || !ctx->fd_tx_brk_sem ||
+  if (!ctx->fd_tx_mux || !ctx->fd_rx_mux ||
           !ctx->fd_tx_done_sem || !ctx->fd_tx_fifo_sem) {
     goto err;
   }
@@ -326,8 +327,13 @@ esp_err_t bridge_driver_install(fullduplex_uart_config_t *fd_uart_cfg, rs485_uar
     merge_wire_driver_uart_ctx[rs485_num].port_id = rs485_num;
     merge_wire_driver_uart_ctx[rs485_num].uart_ctx = ctx;
 
-    ctx->fd_uart_to_rs485.producer_tx_waiting_brk = false;
-    ctx->rs485_to_fd_uart.producer_tx_waiting_brk = false;
+    ctx->fd_uart_to_rs485.producer_port = uart_num;
+    ctx->fd_uart_to_rs485.consumer_port = rs485_num;
+    ctx->rs485_to_fd_uart.producer_port = rs485_num;
+    ctx->rs485_to_fd_uart.consumer_port = uart_num;
+
+    ctx->fd_uart_to_rs485.consumer_tx_waiting_brk = false;
+    ctx->rs485_to_fd_uart.consumer_tx_waiting_brk = false;
 
     ctx->fd_uart_to_rs485.tx_ptr = NULL;
     ctx->fd_uart_to_rs485.chunk_rem_len = 0;

@@ -10,6 +10,9 @@ void BRIDGE_ISR_ATTR bridge_uart_intr_handler(void *param) {
   bridge_port_obj_t *port_obj = &ctx->fd_uart_to_rs485;
 
   bool rx_buffer_free = true;
+  bool brk_waiting = false;
+  bool chunk_in_flight = false;
+  bool ringbuf_empty = false;
   uint32_t uart_intr_status = 0;
   BaseType_t HPTaskAwoken = 0;
   bool need_yield = false;
@@ -23,9 +26,12 @@ void BRIDGE_ISR_ATTR bridge_uart_intr_handler(void *param) {
       UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
       uart_hal_clr_intsts_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TXFIFO_EMPTY);
 
+      // try to fill the TX FIFO from the producer to consumer bridging ring buffer
+      bridge_fill_tx_fifo(&ctx->rs485_to_fd_uart, &brk_waiting, &chunk_in_flight, &ringbuf_empty, &HPTaskAwoken, &need_yield);
 
-
-      if (en_tx_flg) {
+      if ((chunk_in_flight || !ringbuf_empty) && !brk_waiting) {
+        // if there is still a chunk in flight, or the ringbuf is not empty AND there is
+        // no break currently waiting to be sent, then re-enable the TXFIFO_EMPTY interrupt
         uart_hal_clr_intsts_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TXFIFO_EMPTY);
         UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
         uart_hal_ena_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TXFIFO_EMPTY);
@@ -50,7 +56,7 @@ void BRIDGE_ISR_ATTR bridge_uart_intr_handler(void *param) {
         if (chunk->data_len > 0) {
           // try to send the data to the ring buffer
           bool sent = bridge_try_send_ring_buf(
-            port_obj, uart_num,
+            port_obj,
             (const uint8_t *) chunk, chunk->data_len + sizeof(bridge_uart_data_t),
             &HPTaskAwoken, &need_yield);
           if (sent) {
@@ -74,7 +80,7 @@ void BRIDGE_ISR_ATTR bridge_uart_intr_handler(void *param) {
             brk->data_len = 0;
             // try to send the data to the ring buffer
             bridge_try_send_ring_buf(
-              port_obj, uart_num,
+              port_obj,
               (const uint8_t *) brk, sizeof(bridge_uart_data_t),
               &HPTaskAwoken, &need_yield);
             // if failed, the data is already stashed inside the rx buffer, no need to set flags
@@ -97,8 +103,13 @@ void BRIDGE_ISR_ATTR bridge_uart_intr_handler(void *param) {
         // now we wait for the rs485 bus to service the queue in order to re-enable interrupts
       }
 
-      // here we can check if the rs485 buffer has space in its fifo to push data
-
+      // here we can check if the rs485 uart has space in its fifo to push data to reduce latency
+      // grab the lock for the RS485 state machine
+      portENTER_CRITICAL_ISR(&ctx->lock);
+      bridge_rs485_carrier_sense_try_tx(ctx, &HPTaskAwoken, &need_yield);
+      need_yield |= (HPTaskAwoken == pdTRUE);
+      // release the lock for the RS485 state machine
+      portEXIT_CRITICAL_ISR(&ctx->lock);
     } else if (uart_intr_status & UART_INTR_RXFIFO_OVF) {
       // When fifo overflows, we reset the fifo.
       UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
@@ -109,17 +120,13 @@ void BRIDGE_ISR_ATTR bridge_uart_intr_handler(void *param) {
       UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
       uart_hal_tx_break(&(merge_wire_uart_context[uart_num].hal), 0);
       uart_hal_disable_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_BRK_DONE);
-      if (port_obj->producer_tx_waiting_brk) {
+      if (ctx->rs485_to_fd_uart.consumer_tx_waiting_brk) {
+        // we were waiting for a brk to send, re-enable TXFIFO_EMPTY interrupt
         uart_hal_ena_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TXFIFO_EMPTY);
       }
       UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
       uart_hal_clr_intsts_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_BRK_DONE);
-      if (port_obj->producer_tx_waiting_brk) {
-        port_obj->producer_tx_waiting_brk = false;
-      } else {
-        xSemaphoreGiveFromISR(ctx->fd_tx_brk_sem, &HPTaskAwoken);
-        need_yield |= (HPTaskAwoken == pdTRUE);
-      }
+      ctx->rs485_to_fd_uart.consumer_tx_waiting_brk = false;
     } else if (uart_intr_status & UART_INTR_TX_DONE) {
       // Workaround for RS485: If the RS485 half duplex mode is active
       // and transmitter is in idle state then reset received buffer and reset RTS pin

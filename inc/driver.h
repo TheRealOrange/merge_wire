@@ -31,6 +31,9 @@ typedef enum {
 } bridge_rs485_state_t;
 
 typedef struct {
+  uart_port_t producer_port;
+  uart_port_t consumer_port;
+
   // bridging ringbufs from either UART
   RingbufHandle_t bridging_ringbuf;        /*!< Bridging buffer from producer to consumer*/
   bridge_uart_data_t *chunk_in_flight;     /*!< Consumer current chunk in flight to be sent*/
@@ -45,7 +48,7 @@ typedef struct {
   uint8_t *producer_rx_data_buf;           /*!< Producer data buffer to stash RX FIFO data or store stashed chunks to be sent to consumer*/
 
   // break send flags
-  bool producer_tx_waiting_brk;            /*!< Flag to indicate that producer TX FIFO is ready to send break signal after FIFO is empty, do not push data into TX FIFO right now*/
+  bool consumer_tx_waiting_brk;            /*!< Flag to indicate that producer TX FIFO is ready to send break signal after FIFO is empty, do not push data into TX FIFO right now*/
   bool tx_brk_stashed_flg;                 /*!< Flag to indicate to send a break signal in ring buf once space available (stashed brk) for consumer*/
   uint8_t tx_brk_stashed_len;              /*!< Stashed break signal cycle length/number for consumer*/
 } bridge_port_obj_t;

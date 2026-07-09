@@ -25,10 +25,12 @@ extern bridge_uart_port_context_t merge_wire_uart_context[UART_NUM_MAX];
 #define UART_EXIT_CRITICAL(spinlock)         esp_os_exit_critical(spinlock)
 
 uint32_t bridge_enable_tx_write_fifo(uart_port_t uart_num, const uint8_t *pbuf, uint32_t len);
-bool bridge_try_send_ring_buf(bridge_port_obj_t *ctx, uart_port_t producer_port, const uint8_t *data, uint32_t len, BaseType_t *HPTaskAwoken, bool *need_yield;
-void bridge_service_producer(bridge_port_obj_t *ctx, uart_port_t producer_port, BaseType_t *HPTaskAwoken, bool *need_yield);
+void bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool *brk_waiting_int_ena, bool *chunk_in_flight, bool *ringbuf_empty, BaseType_t *HPTaskAwoken, bool *need_yield);
+bool bridge_try_send_ring_buf(bridge_port_obj_t *ctx, const uint8_t *data, uint32_t len, BaseType_t *HPTaskAwoken, bool *need_yield);
+void bridge_service_producer(bridge_port_obj_t *ctx, BaseType_t *HPTaskAwoken, bool *need_yield);
 void bridge_read_fifo_chunk(uart_port_t port, uint8_t *stash_buf, uint32_t status, bool *got_brk);
 
+void bridge_rs485_carrier_sense_try_tx(bridge_context_t *ctx, BaseType_t *HPTaskAwoken, bool *need_yield);
 void bridge_rs485_kick_cb(void *arg);
 
 void bridge_uart_intr_handler(void *param);
