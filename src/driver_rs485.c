@@ -85,6 +85,23 @@ void BRIDGE_ISR_ATTR bridge_rs485_carrier_sense_try_tx(bridge_context_t *ctx, Ba
   // carrier sense should only run if the bus is currently IDLE, i.e. not TX'ing or otherwise already
   // in control of the RS485 bus
   if (ctx->r_state != BRIDGE_RS485_IDLE) return;
+
+  // pull the next chunk BEFORE touching DE or arming timers
+  // an empty ring must cost nothing (no DE blip on the bus, no spurious kick). under
+  // defer-return semantics a pulled chunk simply waits in the in-flight
+  // slot across any quiet-window kick; fill() sees it and never re-pulls.
+  bridge_port_obj_t *m2r = &ctx->fd_uart_to_rs485;
+  if (m2r->chunk_in_flight == NULL && m2r->chunk_rem_len == 0) {
+    size_t size;
+    m2r->chunk_in_flight = xRingbufferReceiveFromISR(m2r->bridging_ringbuf, &size);
+    if (m2r->chunk_in_flight != NULL && m2r->chunk_in_flight->tx_brk_len == 0) {
+      m2r->tx_ptr = m2r->chunk_in_flight->data;
+      m2r->chunk_rem_len = m2r->chunk_in_flight->data_len;
+    }
+  }
+  if (m2r->chunk_in_flight == NULL) {
+    return;    // nothing queued: leave the bus and the timer alone
+  }
   uint8_t uart_num = ctx->rs485_uart_num;
   // we want to check if the bus has been idle long enough
   // QUIET_BITS elapsed so that we know the bus is idle and
@@ -126,30 +143,37 @@ void BRIDGE_ISR_ATTR bridge_rs485_carrier_sense_try_tx(bridge_context_t *ctx, Ba
   } else {
     // the quiet time has elapsed AND there is no data in the RX FIFO
     // the bus is truly quiet so we try to TX here
-    bool brk_waiting = false;
-    bool chunk_in_flight = false;
-    bool ringbuf_empty = false;
+
     // take control of the UART driver
     DE_ASSERT(uart_num);
     esp_rom_delay_us(DE_SETTLE_US);
-    ctx->r_state = BRIDGE_RS485_TX;
-    bridge_fill_tx_fifo(&ctx->fd_uart_to_rs485, true, &brk_waiting, &chunk_in_flight, &ringbuf_empty, HPTaskAwoken, need_yield);
-    UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
-    if (brk_waiting) {
-      // we scheduled a forwarded BRK
-      ctx->r_state = BRIDGE_RS485_BRK;
+
+    if (m2r->chunk_in_flight->tx_brk_len > 0) {
+      // leading / bare break: DE is up, arm it and let TX_BRK_DONE chain
+      bridge_uart_data_t *brk = m2r->chunk_in_flight;
+      m2r->chunk_in_flight = NULL;
+      UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
       uart_hal_disable_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TXFIFO_EMPTY | UART_INTR_TX_DONE);
-    } else if (!ringbuf_empty) {
-      // there is still data to be sent, enable the TXFIFO_EMPTY interrupt
-      uart_hal_ena_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TXFIFO_EMPTY);
-    } else if (chunk_in_flight && ringbuf_empty) {
-      // wind down TX'ing and handle the TX_DONE interrupt
-      uart_hal_ena_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_DONE);
+      UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
+      bridge_arm_brk_chunk(m2r, brk, HPTaskAwoken, need_yield);
+      ctx->r_state = BRIDGE_RS485_BRK;
+      return;
+    }
+
+    ctx->r_state = BRIDGE_RS485_TX;
+    bool brk_waiting = false;
+    bool chunk_in_flight = false;
+    bool ringbuf_empty = false;
+    bridge_fill_tx_fifo(m2r, true, &brk_waiting, &chunk_in_flight, &ringbuf_empty, HPTaskAwoken, need_yield);
+    // enable matrix, decided from the AUTHORITATIVE fields (not the pass
+    // flags): a fully-fed deferred chunk awaits TX_DONE verification; a
+    // partially-fed one streams via TXFIFO_EMPTY.
+    UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
+    uart_hal_clr_intsts_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_DONE);
+    if (m2r->chunk_rem_len > 0) {
+      uart_hal_ena_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_DONE | UART_INTR_TXFIFO_EMPTY);
     } else {
-      // ringbuf empty, and no chunk in flight/chunk committed
-      // relinquish control of the bus
-      ctx->r_state = BRIDGE_RS485_IDLE;
-      DE_RELEASE(uart_num);
+      uart_hal_ena_intr_mask(&(merge_wire_uart_context[uart_num].hal), UART_INTR_TX_DONE);
     }
     UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[uart_num].spinlock));
   }
@@ -334,11 +358,13 @@ void BRIDGE_ISR_ATTR bridge_rs485_intr_handler(void *param) {
           // we scheduled a forwarded BRK
           ctx->r_state = BRIDGE_RS485_BRK;
           uart_hal_disable_intr_mask(&(merge_wire_uart_context[ctx->rs485_uart_num].hal), UART_INTR_TXFIFO_EMPTY | UART_INTR_TX_DONE);
-        } else if (!ringbuf_empty) {
-          // there is still data to be sent, enable the TXFIFO_EMPTY interrupt
-          uart_hal_ena_intr_mask(&(merge_wire_uart_context[ctx->rs485_uart_num].hal), UART_INTR_TXFIFO_EMPTY);
-        } else if (chunk_in_flight && ringbuf_empty) {
-          // wind down TX'ing and handle the TX_DONE interrupt
+        } else if (ctx->fd_uart_to_rs485.chunk_rem_len > 0) {
+          // chunk partially fed: keep streaming, TX_DONE covers underruns
+          uart_hal_ena_intr_mask(&(merge_wire_uart_context[ctx->rs485_uart_num].hal), UART_INTR_TXFIFO_EMPTY | UART_INTR_TX_DONE);
+        } else if (ctx->fd_uart_to_rs485.chunk_in_flight != NULL) {
+          // chunk fully fed but DEFERRED (un-returned): await wire
+          // verification -- TX_DONE only, EMPTY must stay off or its fill
+          // would pull past the uncommitted chunk
           uart_hal_ena_intr_mask(&(merge_wire_uart_context[ctx->rs485_uart_num].hal), UART_INTR_TX_DONE);
         }
         UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[ctx->rs485_uart_num].spinlock));

@@ -135,6 +135,20 @@ void BRIDGE_ISR_ATTR bridge_service_producer(bridge_port_obj_t *ctx, BaseType_t 
   }
 }
 
+void BRIDGE_ISR_ATTR bridge_arm_brk_chunk(bridge_port_obj_t *ctx, bridge_uart_data_t *chunk, BaseType_t *HPTaskAwoken, bool *need_yield) {
+  uart_port_t consumer_port = ctx->consumer_port;
+  uart_hal_clr_intsts_mask(&(merge_wire_uart_context[consumer_port].hal), UART_INTR_TX_BRK_DONE);
+  UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[consumer_port].spinlock));
+  uart_hal_tx_break(&(merge_wire_uart_context[consumer_port].hal), chunk->tx_brk_len);
+  uart_hal_ena_intr_mask(&(merge_wire_uart_context[consumer_port].hal), UART_INTR_TX_BRK_DONE);
+  UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[consumer_port].spinlock));
+  ctx->consumer_tx_waiting_brk = true;
+  ctx->breaks_tx++;
+  vRingbufferReturnItemFromISR(ctx->bridging_ringbuf, chunk, HPTaskAwoken);
+  *need_yield |= (*HPTaskAwoken == pdTRUE);
+  bridge_service_producer(ctx, HPTaskAwoken, need_yield);
+}
+
 void BRIDGE_ISR_ATTR bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool defer_return, bool *brk_waiting_int_ena, bool *chunk_in_flight, bool *ringbuf_empty, BaseType_t *HPTaskAwoken, bool *need_yield) {
   uart_port_t consumer_port = ctx->consumer_port;
   // whether or not we enabled the break interrupts because a break is scheduled
@@ -158,30 +172,20 @@ void BRIDGE_ISR_ATTR bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool defer_retu
   // no break waiting, check if we have any data waiting to be sent
   while (tx_fifo_rem > 0) {
     // check if we have a chunk in flight
-    if (ctx->chunk_rem_len == 0) {
-      // no chunk in flight, grab a new chunk from the ringbuf
+    if (ctx->chunk_rem_len == 0 && ctx->chunk_in_flight == NULL) {
+      // no chunk in flight, grab a new chunk from the ringbuf.
+      // (under defer_return a fully-fed chunk keeps chunk_in_flight set until
+      // the TX_DONE commit -- we must NOT pull past it)
       size_t size;
       bridge_uart_data_t *chunk = xRingbufferReceiveFromISR(ctx->bridging_ringbuf, &size);
       if (chunk) {
         // received data from the ringbuf
         if (chunk->tx_brk_len > 0) {
-          // no data in this chunk, set up break
-          uart_hal_clr_intsts_mask(&(merge_wire_uart_context[consumer_port].hal), UART_INTR_TX_BRK_DONE);
-          UART_ENTER_CRITICAL_ISR(&(merge_wire_uart_context[consumer_port].spinlock));
-          uart_hal_tx_break(&(merge_wire_uart_context[consumer_port].hal), chunk->tx_brk_len);
-          uart_hal_ena_intr_mask(&(merge_wire_uart_context[consumer_port].hal), UART_INTR_TX_BRK_DONE);
-          UART_EXIT_CRITICAL_ISR(&(merge_wire_uart_context[consumer_port].spinlock));
-          ctx->consumer_tx_waiting_brk = true;
-          ctx->breaks_tx++;
-
+          // no data in this chunk: it is an in-band break condition
+          bridge_arm_brk_chunk(ctx, chunk, HPTaskAwoken, need_yield);
           // signal that we have a break waiting
           // and that we enabled the break interrupts
           if (brk_waiting_int_ena) *brk_waiting_int_ena = true;
-
-          // return the item to the ISR since we are done processing it
-          vRingbufferReturnItemFromISR(ctx->bridging_ringbuf, chunk, HPTaskAwoken);
-          *need_yield |= (*HPTaskAwoken == pdTRUE);
-          bridge_service_producer(ctx, HPTaskAwoken, need_yield);
 
           // break from the loop to handle the tx brk send
           break;

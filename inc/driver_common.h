@@ -28,8 +28,14 @@ uint32_t bridge_enable_tx_write_fifo(uart_port_t uart_num, const uint8_t *pbuf, 
 void bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool defer_return, bool *brk_waiting_int_ena, bool *chunk_in_flight, bool *ringbuf_empty, BaseType_t *HPTaskAwoken, bool *need_yield);
 bool bridge_try_send_ring_buf(bridge_port_obj_t *ctx, const uint8_t *data, uint32_t len, BaseType_t *HPTaskAwoken, bool *need_yield);
 void bridge_service_producer(bridge_port_obj_t *ctx, BaseType_t *HPTaskAwoken, bool *need_yield);
-void bridge_read_fifo_chunk(uart_port_t port, uint8_t *stash_buf, uint32_t status, bool *got_brk);
 
+// arm an in-band break chunk on the consumer port: hardware appends the
+// break after whatever already sits in the TX FIFO. Returns the chunk to
+// the ring and services the producer
+// Caller manages r_state/DE
+void bridge_arm_brk_chunk(bridge_port_obj_t *ctx, bridge_uart_data_t *chunk, BaseType_t *HPTaskAwoken, bool *need_yield);
+
+void bridge_read_fifo_chunk(uart_port_t port, uint8_t *stash_buf, uint32_t status, bool *got_brk);
 void bridge_rs485_carrier_sense_try_tx(bridge_context_t *ctx, BaseType_t *HPTaskAwoken, bool *need_yield);
 void bridge_rs485_kick_cb(void *arg);
 
