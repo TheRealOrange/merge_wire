@@ -190,7 +190,6 @@ void BRIDGE_ISR_ATTR bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool *brk_waiti
         ctx->chunk_rem_len = chunk->data_len;
         ctx->chunk_in_flight = chunk;
         ctx->tx_ptr = chunk->data;
-        *chunk_in_flight = true;
       } else {
         // cannot get data from ring buffer, return;
         if (ringbuf_empty) *ringbuf_empty = true;
@@ -201,6 +200,7 @@ void BRIDGE_ISR_ATTR bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool *brk_waiti
     if (ctx->chunk_rem_len > 0) {
       // fill the TX fifo from the chunk
       uint32_t send_len = bridge_enable_tx_write_fifo(consumer_port, ctx->tx_ptr, MIN(ctx->chunk_rem_len, tx_fifo_rem));
+      if (chunk_in_flight) *chunk_in_flight = true;
 
       ctx->tx_ptr += send_len;
       ctx->chunk_rem_len -= send_len;
@@ -213,7 +213,6 @@ void BRIDGE_ISR_ATTR bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool *brk_waiti
         ctx->tx_ptr = NULL;
         bridge_service_producer(ctx, HPTaskAwoken, need_yield);
         // chunk fully sent
-        *chunk_in_flight = false;
       }
       // chunk partially sent
     }
