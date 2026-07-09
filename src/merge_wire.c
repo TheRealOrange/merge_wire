@@ -2,23 +2,6 @@
 #include "merge_wire.h"
 #include "driver.h"
 
-#include "esp_intr_alloc.h"
-#include "soc/uart_reg.h"
-
-// full-duplex uart
-static fullduplex_uart_config_t main_uart_ctx;
-
-// rs485 uart
-static rs485_uart_config_t rs485_uart_ctx;
-
-// whether the library has been configured, gates the driver install
-static bool configured = false;
-
-esp_err_t merge_wire_config(fullduplex_uart_config_t uart_cfg, rs485_uart_config_t rs485_cfg) {
-  esp_err_t ret;#include <stdio.h>
-#include "merge_wire.h"
-#include "driver.h"
-
 #include "esp_check.h"
 #include "esp_intr_alloc.h"
 #include "soc/soc_caps.h"
@@ -117,75 +100,4 @@ esp_err_t merge_wire_get_stats(bridge_stats_t *out) {
   ESP_RETURN_ON_FALSE((configured && out != NULL), ESP_ERR_INVALID_STATE, MERGE_WIRE_TAG, "not installed");
   bridge_driver_get_stats(main_uart_ctx.uart_num, out);
   return ESP_OK;
-}
-
-  // check for valid configuration
-  ESP_RETURN_ON_FALSE((uart_cfg.uart_num < UART_NUM_MAX), ESP_FAIL, MERGE_WIRE_TAG, "full-duplex uart_num error");
-  ESP_RETURN_ON_FALSE((rs485_cfg.uart_num < UART_NUM_MAX), ESP_FAIL, MERGE_WIRE_TAG, "rs485 uart_num error");
-  ESP_RETURN_ON_FALSE(
-    (uart_cfg.uart_num != rs485_cfg.uart_num),
-    ESP_FAIL, MERGE_WIRE_TAG,
-    "rs485 and full-duplex uart have to be different"
-    );
-
-  main_uart_ctx = uart_cfg;
-  rs485_uart_ctx = rs485_cfg;
-
-  // set up the full-duplex UART
-  // configure UART parameters
-  ESP_RETURN_ON_FALSE(((ret = uart_param_config(main_uart_ctx.uart_num, &main_uart_ctx.uart_config)) == ESP_OK), ret, MERGE_WIRE_TAG, "uart_param_config error");
-  // set UART pins for RS485 UART
-  ESP_RETURN_ON_FALSE(((ret = bridge_driver_set_pins(
-    main_uart_ctx.uart_num,
-    main_uart_ctx.tx_pin,
-    main_uart_ctx.rx_pin,
-    main_uart_ctx.rts_pin,
-    main_uart_ctx.cts_pin,
-    main_uart_ctx.dtr_pin,
-    main_uart_ctx.dsr_pin
-    )) == ESP_OK), ret, MERGE_WIRE_TAG, "uart_set_pin error");
-
-  // set up the RS485 UART
-  uart_config_t uart_config = {
-    .baud_rate = rs485_cfg.baud_rate,
-    .data_bits = UART_DATA_8_BITS,
-    .parity = UART_PARITY_DISABLE,
-    .stop_bits = UART_STOP_BITS_1,
-    .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-    .rx_flow_ctrl_thresh = 64,
-  };
-  // configure UART parameters
-  ESP_RETURN_ON_FALSE(((ret = uart_param_config(rs485_uart_ctx.uart_num, &uart_config)) == ESP_OK), ret, MERGE_WIRE_TAG, "uart_param_config error");
-  // set UART pins for RS485 UART
-  // NOTE: DTR for RS485 Half-Duplex Mode manages DE/~RE
-  // However, on ESP32 non-UART0 port, DTR signal does not exist, so we use RTS instead
-  // RTS is managed by the software inside the driver, while DTR is controlled by the hardware directly, which eliminates latency
-  // source: https://github.com/espressif/esp-idf/blob/v6.0.2/examples/peripherals/uart/uart_echo_rs485/main/rs485_example.c
-  // since we are taking control, we have to manage the flow control pins
-#if CONFIG_IDF_TARGET_ESP32
-  gpio_num_t rts_pin =  rs485_cfg.de_pin;
-  gpio_num_t dtr_pin =  UART_PIN_NO_CHANGE;
-#define RS485_DTR_PIN UART_PIN_NO_CHANGE
-#else
-  gpio_num_t rts_pin =  UART_PIN_NO_CHANGE;
-  gpio_num_t dtr_pin =  rs485_cfg.de_pin;
-#endif
-  ESP_RETURN_ON_FALSE(((ret = bridge_driver_set_pins(
-    rs485_uart_ctx.uart_num,
-    rs485_cfg.tx_pin,
-    rs485_cfg.rx_pin,
-    rts_pin,
-    UART_PIN_NO_CHANGE,
-    dtr_pin,
-    UART_PIN_NO_CHANGE
-    )) == ESP_OK), ret, MERGE_WIRE_TAG, "uart_set_pin error");
-
-  // we do not install the uart driver for the rs485 uart because we want to handle the peripheral ourselves
-  configured = true;
-  return ESP_OK;
-}
-
-esp_err_t merge_wire_driver_install(int rx_buffer_size, int tx_buffer_size, int rs485_intr_alloc_flags, int uart_intr_alloc_flags) {
-  esp_err_t ret;
-  ESP_RETURN_ON_FALSE((configured), ESP_FAIL, MERGE_WIRE_TAG, "not configured yet!");
 }
