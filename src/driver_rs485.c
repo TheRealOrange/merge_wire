@@ -102,6 +102,11 @@ void BRIDGE_ISR_ATTR bridge_rs485_carrier_sense_try_tx(bridge_context_t *ctx, Ba
   if (m2r->chunk_in_flight == NULL) {
     return;    // nothing queued: leave the bus and the timer alone
   }
+
+  // out-flags for bridge_fill_tx_fifo (declared once, function scope)
+  bool brk_waiting = false;
+  bool chunk_in_flight = false;
+  bool ringbuf_empty = false;
   uint8_t uart_num = ctx->rs485_uart_num;
   // we want to check if the bus has been idle long enough
   // QUIET_BITS elapsed so that we know the bus is idle and
@@ -161,9 +166,6 @@ void BRIDGE_ISR_ATTR bridge_rs485_carrier_sense_try_tx(bridge_context_t *ctx, Ba
     }
 
     ctx->r_state = BRIDGE_RS485_TX;
-    bool brk_waiting = false;
-    bool chunk_in_flight = false;
-    bool ringbuf_empty = false;
     bridge_fill_tx_fifo(m2r, true, &brk_waiting, &chunk_in_flight, &ringbuf_empty, HPTaskAwoken, need_yield);
     // enable matrix, decided from the AUTHORITATIVE fields (not the pass
     // flags): a fully-fed deferred chunk awaits TX_DONE verification; a

@@ -40,4 +40,105 @@ menu "merge_wire UART <-> RS485 bridge"
                 the end-to-end protocol. MW_MAX_RETRIES has no effect.
     endchoice
 
+    menu "Timing and thresholds"
+
+        config MERGE_WIRE_QUIET_BITS
+            int "Carrier-sense quiet window (bit times)"
+            range 4 350
+            default 35
+            help
+                How long the RS485 bus must be silent, measured in bit times
+                at the RS485 baud rate, before the bridge may begin a
+                transmission. The default 35 is the Modbus T3.5 inter-frame
+                gap (3.5 characters). Lower grabs the bus more aggressively;
+                higher is politer on busy multi-drop networks. Collision
+                backoff delays are randomized multiples of this window.
+
+        config MERGE_WIRE_DE_SETTLE_US
+            int "Transceiver DE settle time (microseconds)"
+            range 0 100
+            default 2
+            help
+                Delay between asserting the transceiver's driver-enable pin
+                and writing the first byte into the TX FIFO -- the UART
+                transmitter starts shifting the moment a byte lands, so DE
+                must be stable first. Check your transceiver's driver-enable
+                time; 2 us covers common parts.
+
+        config MERGE_WIRE_FWD_BRK_BITS
+            int "Forwarded break length (bit times)"
+            range 1 255
+            default 12
+            help
+                Width of the break the bridge regenerates on the opposite
+                port when it receives one. Must exceed one character frame
+                (>= 10-11 bits) to register as a break at the receiver. Use
+                at least 22 when bridging DMX512 at 250 kBd (break >= 88 us).
+
+        config MERGE_WIRE_JAM_BITS
+            int "Collision jam break length (0 = disabled)"
+            range 0 255
+            default 0
+            help
+                When > 0, a detected collision keeps DE asserted and jams
+                the bus with a break of this many bit times so every node
+                unambiguously observes the collision (CSMA/CD style;
+                LocoNet jams for 15). When 0, DE drops immediately and the
+                unflushable TX FIFO residue dies into the disabled driver.
+
+        config MERGE_WIRE_MAX_RETRIES
+            int "Chunk replay attempts before giving up"
+            depends on MERGE_WIRE_COLLISION_RETRY
+            range 1 32
+            default 8
+            help
+                Under the replay policy: how many times a collided chunk is
+                rewound and retransmitted, each attempt preceded by a
+                randomized exponential backoff, before it is dropped.
+
+        config MERGE_WIRE_FEED_CAP
+            int "Max bytes per RS485 TX FIFO fill pass"
+            range 16 128
+            default 32
+            help
+                Caps how many bytes each fill adds to the RS485 TX FIFO even
+                when more room exists. The TX FIFO cannot be flushed on
+                UART1/2 (hardware erratum), so everything queued at the
+                moment of a collision drains onto the dead bus before
+                cleanup completes: 32 bytes bounds that to ~2.8 ms at
+                115200 baud, where a full 128-byte FIFO costs ~11 ms.
+                Streaming stays gap-free while interrupt latency is below
+                the empty-threshold's worth of byte times. Does not affect
+                the full-duplex port.
+
+        config MERGE_WIRE_RXFIFO_FULL_THR
+            int "RX FIFO full threshold (bytes)"
+            range 1 120
+            default 64
+            help
+                The RX interrupt fires once this many bytes accumulate.
+                Larger means fewer interrupts but more forwarding latency
+                and less overflow headroom (the hardware FIFO is 128 bytes).
+
+        config MERGE_WIRE_RX_TOUT_BITS
+            int "RX idle timeout (bit times)"
+            range 8 200
+            default 22
+            help
+                End-of-frame detection: the RX timeout interrupt fires after
+                this much line silence with data pending in the FIFO
+                (~2 characters by default). Sets frame-forwarding latency
+                and feeds the carrier-sense activity clock on the RS485 side.
+
+        config MERGE_WIRE_TXFIFO_EMPTY_THR
+            int "TX FIFO empty threshold (bytes)"
+            range 1 120
+            default 16
+            help
+                Streaming top-up watermark: the TX-empty interrupt fires
+                when the FIFO drains below this level, giving the ISR that
+                many byte times to refill before the line goes idle.
+
+    endmenu
+
 endmenu

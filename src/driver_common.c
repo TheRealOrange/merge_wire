@@ -168,6 +168,14 @@ void BRIDGE_ISR_ATTR bridge_fill_tx_fifo(bridge_port_obj_t *ctx, bool defer_retu
   }
 
   uint32_t tx_fifo_rem = uart_hal_get_txfifo_len(&(merge_wire_uart_context[consumer_port].hal));
+  if (defer_return && tx_fifo_rem > MW_FEED_CAP) {
+    // rs485 consumer only: the TX FIFO cannot be flushed (UART1/2 erratum),
+    // so everything queued at the instant of a collision drains onto the
+    // dead bus before cleanup can finish. Capping each fill pass bounds
+    // that residue (32 B ~ 2.8 ms at 115200 vs ~11 ms for a full FIFO);
+    // the TXFIFO_EMPTY watermark keeps streaming gap-free regardless.
+    tx_fifo_rem = MW_FEED_CAP;
+  }
 
   // no break waiting, check if we have any data waiting to be sent
   while (tx_fifo_rem > 0) {
